@@ -1,4 +1,7 @@
-# src/ntlsystoolbox/modules.py
+# modules.py
+# NTL-SysToolbox (MSPR ASRBD) — 3 modules : Diagnostic / Sauvegarde WMS / Audit d’obsolescence
+# Contrainte utilisateur : seulement 2 fichiers Python (cli.py + modules.py)
+
 from __future__ import annotations
 
 import csv
@@ -7,875 +10,809 @@ import ipaddress
 import json
 import os
 import platform
+import shutil
 import socket
 import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone, date
+from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Iterable
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
 
-_STATUS_TO_EXIT = {"SUCCESS": 0, "WARNING": 1, "CRITICAL": 2, "ERROR": 3, "UNKNOWN": 4}
+# =========================
+# Codes supervision (Nagios-like)
+# =========================
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
 
 
-@dataclass
-class ModuleResult:
-    module: str = "module"
-    status: str = "UNKNOWN"
-    summary: str = ""
-    details: Dict[str, Any] = field(default_factory=dict)
-    artifacts: Dict[str, str] = field(default_factory=dict)
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    exit_code: Optional[int] = None
+# =========================
+# Dépendances optionnelles (pour éviter crash si pas installées)
+# =========================
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None  # type: ignore
 
-    def finish(self) -> "ModuleResult":
-        if not self.finished_at:
-            self.finished_at = datetime.now().isoformat(timespec="seconds")
-        st = (self.status or "UNKNOWN").upper()
-        self.status = st
-        if self.exit_code is None:
-            self.exit_code = _STATUS_TO_EXIT.get(st, 4)
-        return self
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "module": self.module,
-            "status": self.status,
-            "exit_code": self.exit_code,
-            "summary": self.summary,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "details": self.details or {},
-            "artifacts": self.artifacts or {},
-        }
+try:
+    import pymysql  # type: ignore
+except Exception:
+    pymysql = None  # type: ignore
 
 
-def _ensure_dir(path: str) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
+# =========================
+# Config par défaut (Annexe C)
+# =========================
+DEFAULT_CONFIG: dict[str, Any] = {
+    "reports_dir": "reports",
+    "diagnostic": {
+        "ad_controllers": ["192.168.10.10", "192.168.10.11"],  # DC01/DC02
+        "ad_ports": [53, 88, 389],  # DNS/Kerberos/LDAP (TCP)
+        "timeout_sec": 2.0,
+        "mysql": {
+            "host": "192.168.10.21",  # WMS-DB
+            "port": 3306,
+            "user": "wms_read",
+            "database": "wms",
+            "password_env": "NTL_MYSQL_PASSWORD",
+        },
+    },
+    "backup": {
+        "mysql": {
+            "host": "192.168.10.21",
+            "port": 3306,
+            "user": "wms_backup",
+            "database": "wms",
+            "password_env": "NTL_MYSQL_PASSWORD",
+        },
+        "mysqldump_path": "mysqldump",
+        "timeout_sec": 30.0,
+        "default_table": "orders",
+    },
+    "audit": {
+        "default_scan_cidr": "192.168.10.0/24",
+        "scan_ports": [22, 80, 135, 445, 3389, 3306],
+        "eol_api_base": "https://endoflife.date/api",
+        "soon_days": 180,
+        "timeout_sec": 1.0,
+    },
+}
 
 
-def save_json_report(result: ModuleResult, out_dir: str = "reports/json") -> str:
-    _ensure_dir(out_dir)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_module = (result.module or "module").replace(" ", "_").replace("-", "_").lower()
-    path = str(Path(out_dir) / f"{safe_module}_{ts}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
-    return path
+# =========================
+# Helpers généraux
+# =========================
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def print_result(
-    result: ModuleResult,
-    json_path: Optional[str] = None,
-    *,
-    json_only: bool = False,
-    quiet: bool = False,
-    verbose: bool = False,
-) -> None:
-    if json_only:
-        print(json_path or "")
-        return
-    if quiet:
-        print(f"{result.module} {result.status} - {result.summary}" + (f" | {json_path}" if json_path else ""))
-        return
-
-    print("\n==============================")
-    print(f"MODULE : {result.module}")
-    print(f"STATUT : {result.status} (exit_code={result.exit_code})")
-    print(f"RÉSUMÉ : {result.summary}")
-    if json_path:
-        print(f"JSON : {json_path}")
-    print("==============================")
-
-    if not verbose:
-        return
-
-    try:
-        print("\nDétails :")
-        print(json.dumps(result.details or {}, indent=2, ensure_ascii=False))
-        if result.artifacts:
-            print("\nArtifacts :")
-            print(json.dumps(result.artifacts, indent=2, ensure_ascii=False))
-    except Exception:
-        pass
+def _ts_utc_compact() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _env(key: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(key)
-    return v if v not in (None, "") else default
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 
-def _prompt(msg: str, default: Optional[str] = None, *, secret: bool = False) -> str:
-    if os.getenv("NTL_NON_INTERACTIVE", "0") == "1":
-        return default or ""
-    suffix = f" [{default}]" if default else ""
-    if secret:
-        try:
-            from getpass import getpass
-
-            v = getpass(f"{msg}{suffix} : ").strip()
-            return v if v else (default or "")
-        except Exception:
-            pass
-    v = input(f"{msg}{suffix} : ").strip()
-    return v if v else (default or "")
+def _write_json(path: Path, payload: Any) -> None:
+    _ensure_dir(path.parent)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _sha256_file(path: str) -> str:
+def _write_text(path: Path, text: str) -> None:
+    _ensure_dir(path.parent)
+    path.write_text(text, encoding="utf-8")
+
+
+def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def _tcp_check(host: str, port: int, timeout_s: float = 2.0) -> Tuple[bool, str]:
-    try:
-        with socket.create_connection((host, port), timeout=timeout_s):
-            return True, "OK"
-    except Exception as e:
-        return False, str(e)
-
-
-def _ping(host: str, timeout_s: int = 2) -> bool:
-    try:
-        if platform.system().lower().startswith("win"):
-            cmd = ["ping", "-n", "1", "-w", str(timeout_s * 1000), host]
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
         else:
-            cmd = ["ping", "-c", "1", "-W", str(timeout_s), host]
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return r.returncode == 0
-    except Exception:
+            out[k] = v
+    return out
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
+
+
+def _comma_list(s: str) -> list[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _get_password(mysql_cfg: dict[str, Any]) -> str:
+    # priorité : password explicite > password_env
+    if mysql_cfg.get("password"):
+        return str(mysql_cfg["password"])
+    env_name = mysql_cfg.get("password_env")
+    if env_name:
+        return os.getenv(str(env_name), "")
+    return ""
+
+
+def load_config(path: str | None = None) -> dict[str, Any]:
+    """
+    Charge la configuration depuis un fichier simple :
+    - JSON (sans dépendance) recommandé si tu veux zéro lib.
+    - YAML supporté si PyYAML est installé (sinon erreur claire).
+    Surcharge possible via variables d’environnement.
+    """
+    cfg_path = Path(path or _env("NTL_CONFIG", "config/config.json") or "config/config.json")
+    user_cfg: dict[str, Any] = {}
+
+    if cfg_path.exists():
+        if cfg_path.suffix.lower() in (".json",):
+            user_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        elif cfg_path.suffix.lower() in (".yml", ".yaml"):
+            try:
+                import yaml  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    "Config YAML détectée mais PyYAML n'est pas installé. "
+                    "Installe PyYAML ou utilise config.json."
+                ) from e
+            user_cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        else:
+            raise RuntimeError("Format config non supporté. Utilise .json (ou .yml/.yaml avec PyYAML).")
+
+    cfg = _deep_merge(DEFAULT_CONFIG, user_cfg)
+
+    # Surcharges env (exemples)
+    if _env("NTL_REPORTS_DIR"):
+        cfg["reports_dir"] = _env("NTL_REPORTS_DIR")
+
+    if _env("NTL_AD_CONTROLLERS"):
+        cfg["diagnostic"]["ad_controllers"] = _comma_list(_env("NTL_AD_CONTROLLERS") or "")
+
+    if _env("NTL_AD_PORTS"):
+        cfg["diagnostic"]["ad_ports"] = [int(x) for x in _comma_list(_env("NTL_AD_PORTS") or "")]
+
+    if _env("NTL_MYSQL_HOST"):
+        cfg["diagnostic"]["mysql"]["host"] = _env("NTL_MYSQL_HOST")
+        cfg["backup"]["mysql"]["host"] = _env("NTL_MYSQL_HOST")
+
+    if _env("NTL_MYSQL_PORT"):
+        p = int(_env("NTL_MYSQL_PORT") or "3306")
+        cfg["diagnostic"]["mysql"]["port"] = p
+        cfg["backup"]["mysql"]["port"] = p
+
+    if _env("NTL_SCAN_CIDR"):
+        cfg["audit"]["default_scan_cidr"] = _env("NTL_SCAN_CIDR")
+
+    return cfg
+
+
+def _tcp_check(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
         return False
 
 
-def _local_system_snapshot() -> Dict[str, Any]:
+def _ping(host: str, timeout_sec: int = 1) -> bool:
+    exe = shutil.which("ping")
+    if not exe:
+        return False
+    sysname = platform.system().lower()
     try:
-        import psutil  # type: ignore
-    except Exception as e:
-        return {"error": "psutil manquant", "hint": "pip install psutil", "exception": str(e)}
+        if "windows" in sysname:
+            # -n 1 one packet, -w timeout(ms)
+            r = subprocess.run(
+                [exe, "-n", "1", "-w", str(timeout_sec * 1000), host],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            # -c 1 one packet, -W timeout(sec) (Linux)
+            r = subprocess.run(
+                [exe, "-c", "1", "-W", str(timeout_sec), host],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return r.returncode == 0
+    except OSError:
+        return False
 
-    hostname = socket.gethostname()
-    os_name = platform.system()
-    os_release = platform.release()
-    os_version = platform.version()
 
-    boot_ts = psutil.boot_time()
-    uptime_s = int(datetime.now().timestamp() - boot_ts)
-    cpu_percent = psutil.cpu_percent(interval=0.5)
-    vm = psutil.virtual_memory()
+def _system_snapshot() -> dict[str, Any]:
+    """
+    État synthétique du serveur local.
+    Conforme au CDC : si exécuté sur Windows Server -> infos Windows,
+    si exécuté sur Ubuntu -> infos Ubuntu.
+    """
+    info: dict[str, Any] = {
+        "collected_at_utc": _now_utc_iso(),
+        "hostname": socket.gethostname(),
+        "os": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+        },
+    }
 
-    if os_name.lower().startswith("win"):
-        root = os.environ.get("SystemDrive", "C:") + "\\"
-    else:
-        root = "/"
+    if psutil is None:
+        info["warning"] = "psutil non installé -> uptime/cpu/ram/disk indisponibles"
+        return info
+
     try:
-        root_usage = psutil.disk_usage(root)
-        disk_percent = float(root_usage.percent)
+        uptime = int(time.time() - psutil.boot_time())
     except Exception:
-        disk_percent = None
+        uptime = 0
+
+    disks: list[dict[str, Any]] = []
+    try:
+        for part in psutil.disk_partitions(all=False):
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+                disks.append(
+                    {
+                        "device": part.device,
+                        "mount": part.mountpoint,
+                        "fstype": part.fstype,
+                        "used_percent": round(usage.percent, 2),
+                        "total_gb": round(usage.total / (1024**3), 2),
+                        "free_gb": round(usage.free / (1024**3), 2),
+                    }
+                )
+            except Exception:
+                continue
+    except Exception:
+        disks = []
+
+    info.update(
+        {
+            "uptime_seconds": uptime,
+            "cpu": {
+                "logical_count": psutil.cpu_count(logical=True),
+                "percent": psutil.cpu_percent(interval=0.6),
+            },
+            "ram": {
+                "total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+                "used_percent": round(psutil.virtual_memory().percent, 2),
+            },
+            "disks": disks,
+        }
+    )
+    return info
+
+
+def _worst(a: int, b: int) -> int:
+    return a if a >= b else b
+
+
+# =========================
+# Module 1 — Diagnostic
+# =========================
+def run_diagnostic(cfg: dict[str, Any]) -> dict[str, Any]:
+    ts = _ts_utc_compact()
+    reports_dir = Path(cfg["reports_dir"]) / "diagnostic"
+    out_json = reports_dir / f"{ts}_diagnostic.json"
+
+    timeout = float(cfg["diagnostic"].get("timeout_sec", 2.0))
+    dcs: list[str] = list(cfg["diagnostic"].get("ad_controllers", []))
+    ports: list[int] = [int(p) for p in cfg["diagnostic"].get("ad_ports", [53, 88, 389])]
+
+    mysql_cfg = dict(cfg["diagnostic"].get("mysql", {}))
+    mysql_password = _get_password(mysql_cfg)
+
+    payload: dict[str, Any] = {
+        "module": "diagnostic",
+        "timestamp_utc": ts,
+        "checks": {
+            "ad_dns": [],
+            "mysql": {},
+            "system_snapshot": {},
+        },
+    }
+
+    code = OK
+
+    # AD/DNS checks
+    for dc in dcs:
+        item = {"host": dc, "ping": False, "ports": {}, "status": "OK"}
+        item["ping"] = _ping(dc, timeout_sec=max(1, int(timeout)))
+        for p in ports:
+            item["ports"][str(p)] = _tcp_check(dc, int(p), timeout)
+
+        ok_ports = all(item["ports"].values()) if item["ports"] else False
+        if not item["ping"] or not ok_ports:
+            item["status"] = "CRITICAL"
+            code = _worst(code, CRITICAL)
+
+        payload["checks"]["ad_dns"].append(item)
+
+    # MySQL check
+    mysql_result: dict[str, Any] = {
+        "host": mysql_cfg.get("host"),
+        "port": int(mysql_cfg.get("port", 3306)),
+        "user": mysql_cfg.get("user"),
+        "database": mysql_cfg.get("database"),
+        "status": "UNKNOWN",
+    }
+
+    if pymysql is None:
+        mysql_result["status"] = "UNKNOWN"
+        mysql_result["error"] = "PyMySQL non installé (pip install PyMySQL)."
+        code = _worst(code, UNKNOWN)
+    else:
+        try:
+            if not mysql_password:
+                raise RuntimeError("Mot de passe MySQL absent (utilise NTL_MYSQL_PASSWORD).")
+            conn = pymysql.connect(
+                host=str(mysql_cfg.get("host")),
+                port=int(mysql_cfg.get("port", 3306)),
+                user=str(mysql_cfg.get("user")),
+                password=mysql_password,
+                database=str(mysql_cfg.get("database")),
+                connect_timeout=max(1, int(timeout)),
+                read_timeout=max(1, int(timeout)),
+                write_timeout=max(1, int(timeout)),
+            )
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+                cur.execute("SELECT VERSION();")
+                mysql_result["version"] = cur.fetchone()[0]
+            conn.close()
+            mysql_result["status"] = "OK"
+        except Exception as e:
+            mysql_result["status"] = "CRITICAL"
+            mysql_result["error"] = str(e)
+            code = _worst(code, CRITICAL)
+
+    payload["checks"]["mysql"] = mysql_result
+
+    # System snapshot (local machine)
+    try:
+        payload["checks"]["system_snapshot"] = _system_snapshot()
+    except Exception as e:
+        payload["checks"]["system_snapshot"] = {"error": str(e)}
+        code = _worst(code, WARNING)
+
+    _write_json(out_json, payload)
+
+    summary = "DIAGNOSTIC OK"
+    if code == WARNING:
+        summary = "DIAGNOSTIC WARNING"
+    elif code == CRITICAL:
+        summary = "DIAGNOSTIC CRITICAL"
+    elif code == UNKNOWN:
+        summary = "DIAGNOSTIC UNKNOWN"
 
     return {
-        "hostname": hostname,
-        "os": {"system": os_name, "release": os_release, "version": os_version},
-        "uptime_seconds": uptime_s,
-        "cpu_percent": float(cpu_percent),
-        "ram_percent": float(vm.percent),
-        "ram_total_gb": round(vm.total / (1024**3), 2),
-        "disk_system_percent": disk_percent,
+        "code": code,
+        "summary": summary,
+        "artifacts": [str(out_json)],
+        "data": payload,
     }
 
 
-@dataclass
-class InfraTargets:
-    dc01: str
-    dc02: str
-    wms_db: str
-    wms_app: str
+# =========================
+# Module 2 — Sauvegarde WMS
+# =========================
+def _mysqldump_available(path_hint: str) -> str | None:
+    return shutil.which(path_hint) or shutil.which("mysqldump")
 
 
-class DiagnosticModule:
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config or {}
+def run_backup(cfg: dict[str, Any], table: str | None = None) -> dict[str, Any]:
+    ts = _ts_utc_compact()
+    base_dir = Path(cfg["reports_dir"]) / "backup"
+    out_sql = base_dir / "sql" / f"{ts}_wms_dump.sql"
+    out_csv = base_dir / "csv" / f"{ts}_{(table or cfg['backup'].get('default_table','table'))}.csv"
+    out_json = base_dir / f"{ts}_backup_manifest.json"
 
-    def _load_targets(self) -> InfraTargets:
-        infra = self.config.get("infrastructure", {}) if isinstance(self.config, dict) else {}
-        dc01_default = _env("NTL_DC01_IP", infra.get("dc01_ip", "192.168.10.10"))
-        dc02_default = _env("NTL_DC02_IP", infra.get("dc02_ip", "192.168.10.11"))
-        wmsdb_default = _env("NTL_WMSDB_IP", infra.get("wms_db_ip", "192.168.10.21"))
-        wmsapp_default = _env("NTL_WMSAPP_IP", infra.get("wms_app_ip", "192.168.10.22"))
+    mysql_cfg = dict(cfg["backup"].get("mysql", {}))
+    mysql_password = _get_password(mysql_cfg)
+    timeout = float(cfg["backup"].get("timeout_sec", 30.0))
+    dump_path_hint = str(cfg["backup"].get("mysqldump_path", "mysqldump"))
+    export_table = table or str(cfg["backup"].get("default_table", "orders"))
 
-        print("\n--- Diagnostic Système ---\n")
-        dc01 = _prompt("IP DC01 (AD/DNS)", dc01_default)
-        dc02 = _prompt("IP DC02 (AD/DNS)", dc02_default)
-        wms_db = _prompt("IP WMS-DB (MySQL)", wmsdb_default)
-        wms_app = _prompt("IP WMS-APP (optionnel)", wmsapp_default)
-        return InfraTargets(dc01=dc01, dc02=dc02, wms_db=wms_db, wms_app=wms_app)
+    code = OK
+    payload: dict[str, Any] = {
+        "module": "backup",
+        "timestamp_utc": ts,
+        "mysql": {
+            "host": mysql_cfg.get("host"),
+            "port": int(mysql_cfg.get("port", 3306)),
+            "user": mysql_cfg.get("user"),
+            "database": mysql_cfg.get("database"),
+        },
+        "artifacts": {},
+    }
 
-    def _mysql_check(self, host: str) -> Tuple[bool, str, Optional[str]]:
-        try:
-            import pymysql  # type: ignore
-        except Exception as e:
-            return False, f"pymysql manquant: {e}", None
+    # 2.1 SQL dump via mysqldump (standard)
+    try:
+        if not mysql_password:
+            raise RuntimeError("Mot de passe MySQL absent (utilise NTL_MYSQL_PASSWORD).")
 
-        db_cfg = self.config.get("database", {}) if isinstance(self.config, dict) else {}
-        port = int(_env("NTL_DB_PORT", str(db_cfg.get("port", 3306))) or "3306")
-        user = _env("NTL_DB_USER", db_cfg.get("user", "root")) or "root"
-        password = _env("NTL_DB_PASS", db_cfg.get("password", "")) or ""
-        dbname = _env("NTL_DB_NAME", db_cfg.get("name", "")) or ""
+        exe = _mysqldump_available(dump_path_hint)
+        if not exe:
+            raise RuntimeError("mysqldump introuvable (installe client MySQL ou configure mysqldump_path).")
 
-        user = _prompt("MySQL user", user)
-        password = _prompt("MySQL password (vide si aucun)", password, secret=True)
-        dbname = _prompt("MySQL database (optionnel)", dbname)
+        env = os.environ.copy()
+        env["MYSQL_PWD"] = mysql_password  # évite d’afficher le mdp en argument
 
-        try:
-            conn = pymysql.connect(
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                database=dbname if dbname else None,
-                connect_timeout=3,
-                read_timeout=3,
-                write_timeout=3,
-                charset="utf8mb4",
-                autocommit=True,
-            )
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-                cur.execute("SELECT VERSION()")
-                v = cur.fetchone()
-                version = v[0] if v else None
-            conn.close()
-            return True, "OK", version
-        except Exception as e:
-            return False, str(e), None
-
-    def run(self) -> ModuleResult:
-        started = datetime.now().isoformat(timespec="seconds")
-        targets = self._load_targets()
-        local = _local_system_snapshot()
-
-        ping_dc01 = _ping(targets.dc01)
-        ping_dc02 = _ping(targets.dc02)
-        ping_wmsdb = _ping(targets.wms_db)
-
-        dc01_dns_ok, _ = _tcp_check(targets.dc01, 53)
-        dc02_dns_ok, _ = _tcp_check(targets.dc02, 53)
-        dc01_krb_ok, _ = _tcp_check(targets.dc01, 88)
-        dc02_krb_ok, _ = _tcp_check(targets.dc02, 88)
-        dc01_ldap_ok, _ = _tcp_check(targets.dc01, 389)
-        dc02_ldap_ok, _ = _tcp_check(targets.dc02, 389)
-
-        dc01_ad_dns_ok = dc01_dns_ok and dc01_krb_ok and dc01_ldap_ok
-        dc02_ad_dns_ok = dc02_dns_ok and dc02_krb_ok and dc02_ldap_ok
-        ad_dns_ok = dc01_ad_dns_ok or dc02_ad_dns_ok
-
-        print("\nTest MySQL (WMS-DB)...")
-        mysql_ok, mysql_msg, mysql_version = self._mysql_check(targets.wms_db)
-
-        status = "SUCCESS" if (ad_dns_ok and mysql_ok) else "ERROR"
-        if (dc01_ad_dns_ok != dc02_ad_dns_ok) and status == "SUCCESS":
-            status = "WARNING"
-
-        summary = "AD/DNS OK, MySQL OK" if (ad_dns_ok and mysql_ok) else "Problème AD/DNS ou MySQL"
-
-        details: Dict[str, Any] = {
-            "targets": {"dc01": targets.dc01, "dc02": targets.dc02, "wms_db": targets.wms_db, "wms_app": targets.wms_app},
-            "ping": {"dc01": ping_dc01, "dc02": ping_dc02, "wms_db": ping_wmsdb},
-            "ad_dns": {
-                "dc01_overall_ok": dc01_ad_dns_ok,
-                "dc02_overall_ok": dc02_ad_dns_ok,
-                "overall_ok": ad_dns_ok,
-            },
-            "mysql": {"ok": mysql_ok, "msg": mysql_msg, "version": mysql_version},
-            "local": local,
-        }
-
-        return ModuleResult(
-            module="diagnostic",
-            status=status,
-            summary=summary,
-            details=details,
-            started_at=started,
-        ).finish()
-
-
-@dataclass
-class DBConfig:
-    host: str
-    port: int
-    user: str
-    password: str
-    db: str
-    csv_table: Optional[str] = None
-
-
-class BackupWMSModule:
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config or {}
-
-    def _load_db_config(self) -> DBConfig:
-        db_cfg = self.config.get("database", {}) if isinstance(self.config, dict) else {}
-        default_host = _env("NTL_DB_HOST", db_cfg.get("host", "192.168.10.21"))
-        default_port = _env("NTL_DB_PORT", str(db_cfg.get("port", 3306)))
-        default_user = _env("NTL_DB_USER", db_cfg.get("user", "root"))
-        default_db = _env("NTL_DB_NAME", db_cfg.get("name", "wms"))
-        default_table = _env("NTL_DB_TABLE", db_cfg.get("table", "")) or None
-
-        print("\n--- Configuration Sauvegarde WMS ---\n")
-        host = _prompt("Host MySQL", default_host)
-        port_str = _prompt("Port MySQL", default_port)
-        try:
-            port = int(port_str)
-        except ValueError:
-            port = 3306
-        user = _prompt("Utilisateur", default_user)
-
-        pwd = _env("NTL_DB_PASS", db_cfg.get("password", ""))
-        if not pwd:
-            pwd = _prompt("Mot de passe (vide si aucun)", "", secret=True)
-
-        db = _prompt("Nom de la base", default_db)
-        table = _prompt("Table à exporter en CSV (optionnel)", default_table or "")
-        csv_table = table.strip() or None
-
-        return DBConfig(host=host, port=port, user=user, password=pwd or "", db=db, csv_table=csv_table)
-
-    def _connect(self, dbc: DBConfig):
-        import pymysql  # type: ignore
-
-        return pymysql.connect(
-            host=dbc.host,
-            port=dbc.port,
-            user=dbc.user,
-            password=dbc.password,
-            database=dbc.db,
-            charset="utf8mb4",
-            autocommit=True,
+        cmd = [
+            exe,
+            "-h",
+            str(mysql_cfg.get("host")),
+            "-P",
+            str(int(mysql_cfg.get("port", 3306))),
+            "-u",
+            str(mysql_cfg.get("user")),
+            "--single-transaction",
+            "--routines",
+            "--events",
+            str(mysql_cfg.get("database")),
+        ]
+        r = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=max(5, int(timeout)),
         )
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode(errors="ignore")[:500])
 
-    def _fetch_tables(self, conn) -> List[str]:
-        with conn.cursor() as cur:
-            cur.execute("SHOW TABLES")
-            rows = cur.fetchall()
-        return [r[0] for r in rows]
+        _ensure_dir(out_sql.parent)
+        out_sql.write_bytes(r.stdout)
 
-    def _dump_sql(self, conn, dbc: DBConfig, out_dir: str) -> Tuple[bool, str, Optional[str]]:
-        try:
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = str(Path(out_dir) / f"wms_backup_{dbc.db}_{ts}.sql")
+        payload["artifacts"]["sql_dump"] = {
+            "path": str(out_sql),
+            "sha256": _sha256_file(out_sql),
+        }
+    except Exception as e:
+        code = _worst(code, CRITICAL)
+        payload["artifacts"]["sql_dump_error"] = str(e)
 
-            tables = self._fetch_tables(conn)
-            if not tables:
-                return False, "Aucune table trouvée.", None
+    # 2.2 Export table CSV
+    try:
+        if pymysql is None:
+            raise RuntimeError("PyMySQL non installé (pip install PyMySQL).")
+        if not mysql_password:
+            raise RuntimeError("Mot de passe MySQL absent (utilise NTL_MYSQL_PASSWORD).")
 
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write("-- NTL SysToolbox SQL Backup\n")
-                f.write(f"-- Database: {dbc.db}\n")
-                f.write(f"-- Generated: {datetime.now().isoformat(timespec='seconds')}\n\n")
-                f.write("SET FOREIGN_KEY_CHECKS=0;\n\n")
+        conn = pymysql.connect(
+            host=str(mysql_cfg.get("host")),
+            port=int(mysql_cfg.get("port", 3306)),
+            user=str(mysql_cfg.get("user")),
+            password=mysql_password,
+            database=str(mysql_cfg.get("database")),
+            connect_timeout=5,
+            read_timeout=30,
+            write_timeout=30,
+        )
+        cursor_class = getattr(pymysql.cursors, "SSCursor", None) or pymysql.cursors.Cursor
+        with conn.cursor(cursor_class) as cur:
+            cur.execute(f"SELECT * FROM `{export_table}`;")
+            cols = [d[0] for d in cur.description]
 
-                for table in tables:
-                    with conn.cursor() as cur:
-                        cur.execute(f"SHOW CREATE TABLE `{table}`")
-                        row = cur.fetchone()
-                        create_stmt = row[1] if row and len(row) > 1 else None
-                    if not create_stmt:
-                        continue
+            _ensure_dir(out_csv.parent)
+            with out_csv.open("w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(cols)
+                rows = 0
+                for row in cur:
+                    w.writerow(list(row))
+                    rows += 1
 
-                    f.write(f"-- Table: `{table}`\n")
-                    f.write(f"DROP TABLE IF EXISTS `{table}`;\n")
-                    f.write(create_stmt + ";\n\n")
+        conn.close()
+        payload["artifacts"]["csv_export"] = {
+            "table": export_table,
+            "rows": rows,
+            "path": str(out_csv),
+            "sha256": _sha256_file(out_csv),
+        }
+    except Exception as e:
+        code = _worst(code, CRITICAL)
+        payload["artifacts"]["csv_export_error"] = str(e)
 
-                    with conn.cursor() as cur:
-                        cur.execute(f"SELECT * FROM `{table}`")
-                        cols = [d[0] for d in cur.description] if cur.description else []
-                        if not cols:
-                            continue
-                        col_list = ", ".join(f"`{c}`" for c in cols)
+    _write_json(out_json, payload)
 
-                        while True:
-                            rows = cur.fetchmany(500)
-                            if not rows:
-                                break
-                            f.write(f"INSERT INTO `{table}` ({col_list}) VALUES\n")
-                            values_lines = []
-                            for r in rows:
-                                vals = []
-                                for v in r:
-                                    vals.append(conn.escape(v))
-                                values_lines.append("(" + ", ".join(vals) + ")")
-                            f.write(",\n".join(values_lines) + ";\n\n")
+    summary = "BACKUP OK" if code == OK else "BACKUP CRITICAL"
+    artifacts = [str(out_json)]
+    if out_sql.exists():
+        artifacts.append(str(out_sql))
+    if out_csv.exists():
+        artifacts.append(str(out_csv))
 
-                f.write("SET FOREIGN_KEY_CHECKS=1;\n")
-
-            return True, "Dump SQL généré.", out_path
-        except Exception as e:
-            return False, str(e), None
-
-    def _export_csv(self, conn, dbc: DBConfig, out_dir: str) -> Tuple[bool, str, Optional[str]]:
-        try:
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            tables = self._fetch_tables(conn)
-            if not tables:
-                return False, "Aucune table trouvée.", None
-
-            table = dbc.csv_table or tables[0]
-            if table not in tables:
-                return False, f"Table '{table}' introuvable.", None
-
-            out_path = str(Path(out_dir) / f"wms_export_{table}_{ts}.csv")
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT * FROM `{table}`")
-                cols = [d[0] for d in cur.description] if cur.description else []
-
-                with open(out_path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f)
-                    if cols:
-                        w.writerow(cols)
-                    while True:
-                        rows = cur.fetchmany(1000)
-                        if not rows:
-                            break
-                        w.writerows(rows)
-
-            return True, f"Export CSV généré (table={table}).", out_path
-        except Exception as e:
-            return False, str(e), None
-
-    def run(self) -> ModuleResult:
-        started = datetime.now().isoformat(timespec="seconds")
-        dbc = self._load_db_config()
-
-        try:
-            conn = self._connect(dbc)
-        except Exception as e:
-            return ModuleResult(
-                module="backup_wms",
-                status="ERROR",
-                summary="Connexion MySQL impossible",
-                details={"error": str(e), "host": dbc.host, "port": dbc.port, "db": dbc.db},
-                started_at=started,
-            ).finish()
-
-        sql_ok = False
-        csv_ok = False
-        sql_msg = ""
-        csv_msg = ""
-        sql_path: Optional[str] = None
-        csv_path: Optional[str] = None
-
-        try:
-            sql_ok, sql_msg, sql_path = self._dump_sql(conn, dbc, out_dir="reports/backup/sql")
-            csv_ok, csv_msg, csv_path = self._export_csv(conn, dbc, out_dir="reports/backup/csv")
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-        status = "SUCCESS" if (sql_ok and csv_ok) else ("WARNING" if (sql_ok or csv_ok) else "ERROR")
-        artifacts: Dict[str, str] = {}
-        if sql_ok and sql_path:
-            artifacts["sql_backup_path"] = sql_path
-            artifacts["sql_backup_sha256"] = _sha256_file(sql_path)
-        if csv_ok and csv_path:
-            artifacts["csv_export_path"] = csv_path
-            artifacts["csv_export_sha256"] = _sha256_file(csv_path)
-
-        return ModuleResult(
-            module="backup_wms",
-            status=status,
-            summary="Sauvegarde WMS SQL/CSV",
-            details={
-                "host": dbc.host,
-                "port": dbc.port,
-                "db": dbc.db,
-                "sql": "OK" if sql_ok else f"FAIL ({sql_msg})",
-                "csv": "OK" if csv_ok else f"FAIL ({csv_msg})",
-                "csv_table": dbc.csv_table or "(auto)",
-            },
-            artifacts=artifacts,
-            started_at=started,
-        ).finish()
+    return {
+        "code": code,
+        "summary": summary,
+        "artifacts": artifacts,
+        "data": payload,
+    }
 
 
-@dataclass
-class EOLMeta:
-    source: str
-    fetched_at_iso: str
-    api_mode: str
-
-
-class EOLProvider:
-    def __init__(self, cache_path: str = "reports/audit/eol_cache.json", ttl_hours: int = 24):
-        self.cache_path = cache_path
-        self.ttl_hours = ttl_hours
-        self._cache: Dict[str, Any] = self._load_cache()
-
-    def _load_cache(self) -> Dict[str, Any]:
-        try:
-            if os.path.exists(self.cache_path):
-                with open(self.cache_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-
-    def _save_cache(self) -> None:
-        try:
-            _ensure_dir(str(Path(self.cache_path).parent))
-            with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump(self._cache, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def _cache_valid(self, fetched_at_iso: str) -> bool:
-        try:
-            fetched = datetime.fromisoformat(fetched_at_iso)
-            return (datetime.now() - fetched).total_seconds() <= self.ttl_hours * 3600
-        except Exception:
-            return False
-
-    def fetch_product(self, product: str) -> Tuple[List[Dict[str, Any]], EOLMeta]:
-        try:
-            import requests  # type: ignore
-        except Exception as e:
-            return [], EOLMeta(source="(requests manquant)", fetched_at_iso="", api_mode=str(e))
-
-        product = product.strip().lower()
-        cached = self._cache.get(product)
-        if cached and isinstance(cached, dict) and self._cache_valid(cached.get("fetched_at_iso", "")):
-            return cached.get("data", []), EOLMeta(
-                source=cached.get("source", "endoflife.date"),
-                fetched_at_iso=cached.get("fetched_at_iso", ""),
-                api_mode=cached.get("api_mode", "cache"),
-            )
-
-        fetched_at_iso = datetime.now().isoformat(timespec="seconds")
-
-        v1_url = f"https://endoflife.date/api/v1/products/{product}/"
-        try:
-            r = requests.get(v1_url, timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list):
-                    meta = EOLMeta(source="endoflife.date", fetched_at_iso=fetched_at_iso, api_mode="v1")
-                    self._cache[product] = {"data": data, "fetched_at_iso": fetched_at_iso, "source": meta.source, "api_mode": meta.api_mode}
-                    self._save_cache()
-                    return data, meta
-        except Exception:
-            pass
-
-        v0_url = f"https://endoflife.date/api/{product}.json"
-        r = requests.get(v0_url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            data = []
-        meta = EOLMeta(source="endoflife.date", fetched_at_iso=fetched_at_iso, api_mode="v0")
-        self._cache[product] = {"data": data, "fetched_at_iso": fetched_at_iso, "source": meta.source, "api_mode": meta.api_mode}
-        self._save_cache()
-        return data, meta
-
-
-def _parse_date(d: Any) -> Optional[date]:
-    if d is None or isinstance(d, bool):
-        return None
-    if isinstance(d, str):
-        try:
-            return datetime.strptime(d, "%Y-%m-%d").date()
-        except Exception:
-            return None
-    return None
-
-
-def _status_from_eol(today: date, eol: Any, soon_days: int) -> Tuple[str, Optional[str]]:
-    if eol is None:
-        return "UNKNOWN", None
-    if isinstance(eol, bool):
-        return ("EOL" if eol else "OK"), None
-    if isinstance(eol, str):
-        dd = _parse_date(eol)
-        if not dd:
-            return "UNKNOWN", eol
-        if dd < today:
-            return "EOL", dd.isoformat()
-        if (dd - today).days <= soon_days:
-            return "SOON", dd.isoformat()
-        return "OK", dd.isoformat()
-    return "UNKNOWN", None
-
-
-def _tcp_ports(host: str, ports: List[int], timeout_s: float = 0.5) -> List[int]:
-    open_ports: List[int] = []
-    for p in ports:
-        try:
-            with socket.create_connection((host, p), timeout=timeout_s):
-                open_ports.append(p)
-        except Exception:
-            pass
-    return open_ports
-
-
-def _guess_os_from_ports(open_ports: List[int]) -> str:
-    if any(p in open_ports for p in (3389, 445, 139)):
+# =========================
+# Module 3 — Audit d’obsolescence
+# =========================
+def _guess_os(open_ports: set[int]) -> str:
+    if open_ports.intersection({135, 445, 3389}):
         return "windows"
     if 22 in open_ports:
         return "linux"
+    if 80 in open_ports:
+        return "unknown_web"
     return "unknown"
 
 
-class AuditObsolescenceModule:
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config or {}
-        self.provider = EOLProvider()
+def run_audit_scan(cfg: dict[str, Any], cidr: str | None = None) -> dict[str, Any]:
+    ts = _ts_utc_compact()
+    cidr = cidr or str(cfg["audit"].get("default_scan_cidr", "192.168.10.0/24"))
+    ports = [int(p) for p in cfg["audit"].get("scan_ports", [22, 80, 135, 445, 3389])]
+    timeout = float(cfg["audit"].get("timeout_sec", 1.0))
 
-    def _menu(self) -> str:
-        print("\n--- Audit Obsolescence ---")
-        print(" [1] Scanner une plage réseau (inventaire + OS probable)")
-        print(" [2] Lister versions + EOL d’un produit/OS (ex: ubuntu, debian, windows, mysql, python)")
-        print(" [3] Import CSV (product+version) + Générer rapport HTML")
-        print(" [0] Retour\n")
-        return input("Choix > ").strip()
+    out_dir = Path(cfg["reports_dir"]) / "audit"
+    out_json = out_dir / f"{ts}_scan_{cidr.replace('/','_')}.json"
 
-    def _scan_range(self, cidr: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        ports = [22, 53, 80, 443, 389, 445, 3389, 3306]
-        timeout_s = float(_env("NTL_SCAN_TIMEOUT", "0.4") or "0.4")
-        workers = int(_env("NTL_SCAN_WORKERS", "120") or "120")
+    net = ipaddress.ip_network(cidr, strict=False)
 
-        net = ipaddress.ip_network(cidr, strict=False)
-        ips = [str(ip) for ip in net.hosts()]
-        results: List[Dict[str, Any]] = []
-
-        def worker(ip: str) -> Optional[Dict[str, Any]]:
-            open_p = _tcp_ports(ip, ports, timeout_s=timeout_s)
-            if not open_p:
+    def probe(ip: str) -> dict[str, Any] | None:
+        # Ping peut être bloqué -> on tente aussi TCP
+        if not _ping(ip, timeout_sec=max(1, int(timeout))):
+            if not any(_tcp_check(ip, p, timeout) for p in ports[:2]):
                 return None
-            return {"ip": ip, "open_ports": sorted(open_p), "os_guess": _guess_os_from_ports(open_p)}
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(worker, ip) for ip in ips]
-            for f in as_completed(futs):
-                item = f.result()
-                if item:
-                    results.append(item)
+        open_ports: set[int] = set()
+        for p in ports:
+            if _tcp_check(ip, p, timeout):
+                open_ports.add(p)
 
-        results.sort(key=lambda x: tuple(int(p) for p in x["ip"].split(".")))
-        stats = {"cidr": cidr, "found_hosts": len(results), "ports_checked": ports, "timeout_s": timeout_s, "workers": workers}
-        return results, stats
+        if not open_ports:
+            return None
 
-    def _list_versions_eol(self, product: str) -> Tuple[List[Dict[str, Any]], EOLMeta]:
-        data, meta = self.provider.fetch_product(product)
-        rows: List[Dict[str, Any]] = []
-        for item in data:
-            if isinstance(item, dict):
-                rows.append(
-                    {
-                        "cycle": item.get("cycle") or item.get("release") or item.get("version"),
-                        "latest": item.get("latest"),
-                        "eol": item.get("eol"),
-                        "releaseDate": item.get("releaseDate") or item.get("released"),
-                    }
-                )
-        rows = [r for r in rows if r.get("cycle")]
-        return rows, meta
+        return {
+            "ip": ip,
+            "open_ports": sorted(open_ports),
+            "os_guess": _guess_os(open_ports),
+        }
 
-    def _read_components_csv(self, path: str) -> List[Dict[str, str]]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"CSV introuvable: {path}")
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=128) as ex:
+        futs = {ex.submit(probe, str(h)): str(h) for h in net.hosts()}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                results.append(r)
 
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            sample = f.read(2048)
-            f.seek(0)
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-            except Exception:
-                dialect = csv.excel
-            reader = csv.DictReader(f, dialect=dialect)
+    payload = {
+        "module": "audit_scan",
+        "timestamp_utc": ts,
+        "cidr": cidr,
+        "scan_ports": ports,
+        "results": sorted(results, key=lambda x: x["ip"]),
+    }
+    _write_json(out_json, payload)
 
-            items: List[Dict[str, str]] = []
-            for row in reader:
-                product = (row.get("product") or row.get("os") or "").strip().lower()
-                version = (row.get("version") or row.get("cycle") or "").strip()
-                name = (row.get("name") or row.get("hostname") or "").strip()
-                if not product or not version:
-                    continue
-                items.append({"name": name or "(n/a)", "product": product, "version": version})
-            return items
+    return {
+        "code": OK,
+        "summary": f"AUDIT SCAN OK ({len(results)} hôtes détectés)",
+        "artifacts": [str(out_json)],
+        "data": payload,
+    }
 
-    def _match_cycle(self, rows: List[Dict[str, Any]], version: str) -> Optional[Dict[str, Any]]:
-        v = version.strip()
-        for r in rows:
-            c = str(r.get("cycle", "")).strip()
-            if not c:
-                continue
-            if v == c or v.startswith(c + ".") or v.startswith(c + " "):
-                return r
-        return None
 
-    def _generate_html_report(
-        self,
-        components: List[Dict[str, Any]],
-        out_path: str,
-        meta_by_product: Dict[str, EOLMeta],
-        soon_days: int,
-    ) -> Dict[str, Any]:
-        counts = {"OK": 0, "SOON": 0, "EOL": 0, "UNKNOWN": 0}
-        for c in components:
-            counts[c["support_status"]] += 1
+def _http_get_json(url: str, timeout_sec: int = 10) -> Any:
+    req = Request(url, headers={"User-Agent": "NTL-SysToolbox/0.1"})
+    with urlopen(req, timeout=timeout_sec) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8"))
 
-        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-        def esc(s: Any) -> str:
-            return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def run_audit_eol_versions(cfg: dict[str, Any], os_name: str) -> dict[str, Any]:
+    ts = _ts_utc_compact()
+    out_dir = Path(cfg["reports_dir"]) / "audit"
+    out_json = out_dir / f"{ts}_eol_{os_name}.json"
 
-        html: List[str] = []
-        html.append("<!doctype html><html><head><meta charset='utf-8'/>")
-        html.append("<title>NTL SysToolbox - Audit d'obsolescence</title>")
-        html.append("<style>body{font-family:system-ui;margin:24px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px}th{background:#f6f6f6}</style>")
-        html.append("</head><body>")
-        html.append(f"<h1>Audit d'obsolescence</h1><p>Généré le {esc(datetime.now().isoformat(timespec='seconds'))} | SOON={soon_days} jours</p>")
+    base = str(cfg["audit"].get("eol_api_base", "https://endoflife.date/api")).rstrip("/")
+    url = f"{base}/{os_name}.json"
 
-        html.append("<h2>Sources EOL</h2><ul>")
-        for prod, m in meta_by_product.items():
-            html.append(f"<li><b>{esc(prod)}</b> — source:{esc(m.source)} — fetch:{esc(m.fetched_at_iso)} — mode:{esc(m.api_mode)}</li>")
-        html.append("</ul>")
+    code = OK
+    payload: dict[str, Any] = {
+        "module": "audit_eol_versions",
+        "timestamp_utc": ts,
+        "os_name": os_name,
+        "source": url,
+        "versions": None,
+    }
 
-        html.append("<h2>Résumé</h2><ul>")
-        for k in ("OK", "SOON", "EOL", "UNKNOWN"):
-            html.append(f"<li>{k}: {counts[k]}</li>")
-        html.append("</ul>")
+    try:
+        payload["versions"] = _http_get_json(url, timeout_sec=10)
+    except HTTPError as e:
+        code = CRITICAL
+        payload["error"] = f"HTTP {e.code}"
+    except URLError as e:
+        code = CRITICAL
+        payload["error"] = f"URL error: {e}"
+    except Exception as e:
+        code = CRITICAL
+        payload["error"] = str(e)
 
-        html.append("<h2>Composants</h2>")
-        html.append("<table><thead><tr><th>Composant</th><th>Produit</th><th>Version</th><th>EOL</th><th>Statut</th></tr></thead><tbody>")
-        for c in components:
-            html.append(
-                "<tr>"
-                f"<td>{esc(c.get('name'))}</td>"
-                f"<td>{esc(c.get('product'))}</td>"
-                f"<td>{esc(c.get('version'))}</td>"
-                f"<td>{esc(c.get('eol_date') or '')}</td>"
-                f"<td><b>{esc(c.get('support_status'))}</b></td>"
-                "</tr>"
-            )
-        html.append("</tbody></table></body></html>")
+    _write_json(out_json, payload)
 
-        Path(out_path).write_text("\n".join(html), encoding="utf-8")
-        return {"counts": counts, "html_report": out_path}
+    summary = "EOL LIST OK" if code == OK else "EOL LIST CRITICAL"
+    return {
+        "code": code,
+        "summary": summary,
+        "artifacts": [str(out_json)],
+        "data": payload,
+    }
 
-    def run_action(self, action: str, **kwargs: Any) -> ModuleResult:
-        started = datetime.now().isoformat(timespec="seconds")
-        today = date.today()
-        soon_days = int(_env("NTL_EOL_SOON_DAYS", "180") or "180")
+
+def _find_eol(versions: list[dict[str, Any]], target_version: str) -> str | None:
+    tv = target_version.strip()
+    for item in versions:
+        if str(item.get("cycle", "")).strip() == tv:
+            eol = item.get("eol")
+            return str(eol) if eol else None
+    return None
+
+
+def run_audit_report_from_csv(cfg: dict[str, Any], csv_path: str) -> dict[str, Any]:
+    ts = _ts_utc_compact()
+    out_dir = Path(cfg["reports_dir"]) / "audit"
+    out_json = out_dir / f"{ts}_audit_report.json"
+    out_html = out_dir / f"{ts}_audit_report.html"
+
+    base = str(cfg["audit"].get("eol_api_base", "https://endoflife.date/api")).rstrip("/")
+    soon_days = int(cfg["audit"].get("soon_days", 180))
+    timeout = float(cfg["audit"].get("timeout_sec", 1.0))
+
+    # lecture CSV attendu : host, os, version (noms flexibles mais on essaye standard)
+    rows: list[dict[str, str]] = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append({k: (v or "").strip() for k, v in r.items()})
+
+    def pick(d: dict[str, str], *keys: str) -> str:
+        for k in keys:
+            if k in d and d[k]:
+                return d[k]
+        return ""
+
+    # cache EOL par OS
+    eol_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def get_versions(os_name: str) -> list[dict[str, Any]]:
+        if os_name in eol_cache:
+            return eol_cache[os_name]
+        url = f"{base}/{os_name}.json"
+        v = _http_get_json(url, timeout_sec=10)
+        if not isinstance(v, list):
+            raise RuntimeError("Format EOL inattendu")
+        eol_cache[os_name] = v
+        return v
+
+    today = date.today()
+    code = OK
+    findings: list[dict[str, Any]] = []
+
+    for r in rows:
+        host = pick(r, "host", "hostname", "ip")
+        os_name = pick(r, "os", "os_name", "system").lower()
+        version = pick(r, "version", "cycle", "os_version")
+
+        item: dict[str, Any] = {
+            "host": host,
+            "os": os_name,
+            "version": version,
+            "eol": None,
+            "status": "UNKNOWN",
+        }
 
         try:
-            if action == "scan_range":
-                cidr = str(kwargs.get("cidr", "")).strip()
-                inv, stats = self._scan_range(cidr)
-                return ModuleResult(
-                    module="obsolescence",
-                    status="SUCCESS",
-                    summary=f"Scan terminé ({stats.get('found_hosts')} hôtes)",
-                    details={"action": "scan_range", "stats": stats, "inventory": inv},
-                    started_at=started,
-                ).finish()
+            versions = get_versions(os_name)
+            eol_str = _find_eol(versions, version)
+            item["eol"] = eol_str
 
-            if action == "list_versions_eol":
-                product = str(kwargs.get("product", "")).strip().lower()
-                rows, meta = self._list_versions_eol(product)
-                out_rows = []
-                for r in rows:
-                    st, eol_date = _status_from_eol(today, r.get("eol"), soon_days)
-                    rr = dict(r)
-                    rr["support_status"] = st
-                    rr["eol_date"] = eol_date
-                    out_rows.append(rr)
-
-                status = "WARNING" if any(x["support_status"] == "EOL" for x in out_rows) else "SUCCESS"
-                return ModuleResult(
-                    module="obsolescence",
-                    status=status,
-                    summary=f"EOL list: {product} ({len(out_rows)} cycles)",
-                    details={"action": "list_versions_eol", "product": product, "rows": out_rows, "meta": meta.__dict__},
-                    started_at=started,
-                ).finish()
-
-            if action == "csv_to_report":
-                csv_path = str(kwargs.get("csv_path", "")).strip()
-                components_src = self._read_components_csv(csv_path)
-
-                meta_by_product: Dict[str, EOLMeta] = {}
-                cache_rows: Dict[str, List[Dict[str, Any]]] = {}
-                for item in components_src:
-                    prod = item["product"]
-                    if prod not in cache_rows:
-                        rows, meta = self._list_versions_eol(prod)
-                        cache_rows[prod] = rows
-                        meta_by_product[prod] = meta
-
-                components: List[Dict[str, Any]] = []
-                for item in components_src:
-                    prod = item["product"]
-                    version = item["version"]
-                    rows = cache_rows.get(prod, [])
-                    match = self._match_cycle(rows, version)
-                    eol_val = match.get("eol") if match else None
-                    st, eol_date = _status_from_eol(today, eol_val, soon_days)
-                    components.append(
-                        {"name": item["name"], "product": prod, "version": version, "support_status": st, "eol_date": eol_date}
-                    )
-
-                out_html = "reports/audit/audit_report.html"
-                report = self._generate_html_report(components, out_html, meta_by_product, soon_days)
-                counts = report.get("counts", {}) or {}
-                status = "WARNING" if counts.get("EOL", 0) > 0 else "SUCCESS"
-
-                return ModuleResult(
-                    module="obsolescence",
-                    status=status,
-                    summary="Rapport HTML généré",
-                    details={"action": "csv_to_report", "csv_path": csv_path, "report": report},
-                    artifacts={"html_report": out_html},
-                    started_at=started,
-                ).finish()
-
-            return ModuleResult(
-                module="obsolescence",
-                status="ERROR",
-                summary=f"Action inconnue: {action}",
-                details={"action": action, "kwargs": kwargs},
-                started_at=started,
-            ).finish()
-
+            if not eol_str:
+                item["status"] = "UNKNOWN"
+                code = _worst(code, UNKNOWN)
+            else:
+                eol_date = datetime.strptime(eol_str, "%Y-%m-%d").date()
+                delta = (eol_date - today).days
+                if delta < 0:
+                    item["status"] = "EOL"
+                    code = _worst(code, CRITICAL)
+                elif delta <= soon_days:
+                    item["status"] = "SOON"
+                    code = _worst(code, WARNING)
+                else:
+                    item["status"] = "SUPPORTED"
         except Exception as e:
-            return ModuleResult(
-                module="obsolescence",
-                status="ERROR",
-                summary="Audit obsolescence: exception",
-                details={"action": action, "error": str(e), "kwargs": kwargs},
-                started_at=started,
-            ).finish()
+            item["error"] = str(e)
+            item["status"] = "UNKNOWN"
+            code = _worst(code, UNKNOWN)
 
-    def run(self) -> ModuleResult:
-        while True:
-            ch = self._menu()
-            if ch == "0":
-                return ModuleResult(module="obsolescence", status="SUCCESS", summary="Retour menu", details={"action": "interactive"}, started_at=datetime.now().isoformat(timespec="seconds")).finish()
-            if ch == "1":
-                cidr = _prompt("CIDR (ex: 192.168.10.0/24)", self.config.get("networks", {}).get("siege", "192.168.10.0/24"))
-                return self.run_action("scan_range", cidr=cidr)
-            if ch == "2":
-                product = _prompt("Produit (ex: ubuntu, debian, windows, mysql, python)", "ubuntu").lower().strip()
-                return self.run_action("list_versions_eol", product=product)
-            if ch == "3":
-                csv_path = _prompt("Chemin CSV (colonnes: product/os + version)", "inventory.csv")
-                return self.run_action("csv_to_report", csv_path=csv_path)
-            print("Choix invalide.")
+        findings.append(item)
+
+    payload = {
+        "module": "audit_report_from_csv",
+        "timestamp_utc": ts,
+        "input_csv": csv_path,
+        "soon_days": soon_days,
+        "results": findings,
+    }
+    _write_json(out_json, payload)
+
+    # rapport HTML exploitable
+    def badge(status: str) -> str:
+        if status == "SUPPORTED":
+            return "OK"
+        if status == "SOON":
+            return "WARNING"
+        if status == "EOL":
+            return "CRITICAL"
+        return "UNKNOWN"
+
+    html_rows = []
+    for it in findings:
+        html_rows.append(
+            "<tr>"
+            f"<td>{html_escape(it.get('host',''))}</td>"
+            f"<td>{html_escape(it.get('os',''))}</td>"
+            f"<td>{html_escape(it.get('version',''))}</td>"
+            f"<td>{html_escape(str(it.get('eol','')))}</td>"
+            f"<td>{html_escape(badge(it.get('status','UNKNOWN')))}</td>"
+            "</tr>"
+        )
+
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>NTL - Audit Obsolescence</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;margin:20px}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{border:1px solid #ddd;padding:8px}"
+        "th{background:#f3f3f3;text-align:left}"
+        "</style>"
+        "</head><body>"
+        f"<h1>Audit d’obsolescence</h1>"
+        f"<p>Généré: {html_escape(ts)} UTC</p>"
+        f"<p>Seuil 'bientôt EOL': {soon_days} jours</p>"
+        "<table><thead><tr>"
+        "<th>Host</th><th>OS</th><th>Version</th><th>EOL</th><th>Statut</th>"
+        "</tr></thead><tbody>"
+        + "".join(html_rows)
+        + "</tbody></table></body></html>"
+    )
+    _write_text(out_html, html)
+
+    summary = "AUDIT REPORT OK"
+    if code == WARNING:
+        summary = "AUDIT REPORT WARNING"
+    elif code == CRITICAL:
+        summary = "AUDIT REPORT CRITICAL"
+    elif code == UNKNOWN:
+        summary = "AUDIT REPORT UNKNOWN"
+
+    return {
+        "code": code,
+        "summary": summary,
+        "artifacts": [str(out_json), str(out_html)],
+        "data": payload,
+    }
