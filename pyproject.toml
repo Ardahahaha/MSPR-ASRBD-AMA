@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ntl-systoolbox"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = ["pyyaml", "requests", "psutil", "pymysql"]
+
+[project.scripts]
+ntl-systoolbox = "ntlsystoolbox.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
