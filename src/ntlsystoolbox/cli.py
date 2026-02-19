@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -10,33 +11,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Import robuste : marche en package ET en exécution locale
-try:
-    from ntlsystoolbox.modules import (  # type: ignore
-        AuditObsolescenceModule,
-        BackupWMSModule,
-        DiagnosticModule,
-        ModuleResult,
-        print_result,
-        save_json_report,
-    )
-except ImportError:
-    try:
-        from modules import (  # type: ignore
-            AuditObsolescenceModule,
-            BackupWMSModule,
-            DiagnosticModule,
-            ModuleResult,
-            print_result,
-            save_json_report,
-        )
-    except ImportError as e:
-        raise ImportError(
-            "Impossible d'importer ntlsystoolbox.modules. "
-            "Vérifie PYTHONPATH=src ou installe le package (pip install -e .)."
-        ) from e
-
 __version__ = "1.0.0"
+
+
+def _load_modules():
+    """
+    Fix 1 (important) : import "lazy" + robuste.
+    - `ntl-systoolbox --help` ne doit pas crasher si modules.py est cassé.
+    - On SUPPRIME le fallback `from modules import ...` (ça casse en package installé).
+    - Si exécution locale, on ajoute `src/` au sys.path.
+    """
+    try:
+        return importlib.import_module("ntlsystoolbox.modules")
+    except ModuleNotFoundError:
+        # exécution locale (sans install) : ajoute .../src
+        here = Path(__file__).resolve()
+        src_dir = here.parents[1]  # .../src
+        if str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+        return importlib.import_module("ntlsystoolbox.modules")
 
 
 def _isatty() -> bool:
@@ -136,6 +129,7 @@ class UI:
 
 _UI = UI()
 
+# (garde tes DEFAULTS au cas où load_config n'existe pas encore)
 DEFAULTS: Dict[str, Any] = {
     "infrastructure": {
         "dc01_ip": "192.168.10.10",
@@ -149,7 +143,7 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
-def _load_config(path: Optional[str]) -> Tuple[Dict[str, Any], str]:
+def _load_config_legacy(path: Optional[str]) -> Tuple[Dict[str, Any], str]:
     candidates: List[str] = []
     if path:
         candidates.append(path)
@@ -211,21 +205,27 @@ def _pause(msg: str = "Appuie sur Entrée pour continuer…") -> None:
         print()
 
 
-def _list_reports(limit: int = 10) -> List[Path]:
-    p = Path("reports/json")
+def _reports_base(cfg: Dict[str, Any]) -> Path:
+    # Fix 2 : base sur reports_dir si présent (nouveau modules.py), sinon fallback legacy
+    return Path(str(cfg.get("reports_dir", "reports")))
+
+
+def _list_reports(cfg: Dict[str, Any], limit: int = 10) -> List[Path]:
+    p = _reports_base(cfg) / "json"
     if not p.exists():
         return []
     return sorted(p.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)[:limit]
 
 
-def _show_reports() -> None:
+def _show_reports(cfg: Dict[str, Any]) -> None:
     _UI.clear()
-    _UI.title_block(__version__, str(Path("reports/json").resolve()), _env_true("NTL_NON_INTERACTIVE"))
+    hint = str((_reports_base(cfg) / "json").resolve())
+    _UI.title_block(__version__, hint, _env_true("NTL_NON_INTERACTIVE"))
     print(_UI.bold("Derniers rapports JSON\n"))
 
-    files = _list_reports(12)
+    files = _list_reports(cfg, 12)
     if not files:
-        print(_UI.yellow("Aucun rapport trouvé (reports/json/*.json)."))
+        print(_UI.yellow(f"Aucun rapport trouvé ({hint}/*.json)."))
         _pause()
         return
 
@@ -258,13 +258,13 @@ def _show_reports() -> None:
     _pause()
 
 
-def _handle_result(result: ModuleResult, *, json_only: bool, quiet: bool, verbose: bool) -> int:
-    json_path = save_json_report(result)
-    print_result(result, json_path=json_path, json_only=json_only, quiet=quiet, verbose=verbose)
+def _handle_result(mods, result, *, json_only: bool, quiet: bool, verbose: bool) -> int:
+    json_path = mods.save_json_report(result)
+    mods.print_result(result, json_path=json_path, json_only=json_only, quiet=quiet, verbose=verbose)
     return int(result.exit_code or 0)
 
 
-def _menu_loop(cfg: Dict[str, Any], cfg_path: str) -> int:
+def _menu_loop(mods, cfg: Dict[str, Any], cfg_path: str) -> int:
     while True:
         _UI.clear()
         _UI.title_block(__version__, cfg_path, _env_true("NTL_NON_INTERACTIVE"))
@@ -280,25 +280,25 @@ def _menu_loop(cfg: Dict[str, Any], cfg_path: str) -> int:
         choice = input("Votre choix > ").strip().lower()
 
         if choice == "1":
-            res = DiagnosticModule(cfg).run()
-            _handle_result(res, json_only=False, quiet=False, verbose=True)
+            res = mods.DiagnosticModule(cfg).run()
+            _handle_result(mods, res, json_only=False, quiet=False, verbose=True)
             _pause()
             continue
 
         if choice == "2":
-            res = BackupWMSModule(cfg).run()
-            _handle_result(res, json_only=False, quiet=False, verbose=True)
+            res = mods.BackupWMSModule(cfg).run()
+            _handle_result(mods, res, json_only=False, quiet=False, verbose=True)
             _pause()
             continue
 
         if choice == "3":
-            res = AuditObsolescenceModule(cfg).run()
-            _handle_result(res, json_only=False, quiet=False, verbose=True)
+            res = mods.AuditObsolescenceModule(cfg).run()
+            _handle_result(mods, res, json_only=False, quiet=False, verbose=True)
             _pause()
             continue
 
         if choice == "4":
-            _show_reports()
+            _show_reports(cfg)
             continue
 
         if choice == "q":
@@ -331,23 +331,64 @@ def main(argv: Optional[List[str]] = None) -> int:
     if ns.non_interactive:
         os.environ["NTL_NON_INTERACTIVE"] = "1"
 
-    cfg_raw, cfg_path = _load_config(ns.config)
-    cfg = _merge_defaults(cfg_raw)
+    # IMPORTANT : import modules APRES parse_args (sinon `--help` crash)
+    try:
+        mods = _load_modules()
+    except Exception as e:
+        print(
+            "Erreur import ntlsystoolbox.modules.\n"
+            "Vérifie que tu as bien `pip install -e .` et que `src/ntlsystoolbox/modules.py` est valide.\n"
+            f"Détail: {e}",
+            file=sys.stderr,
+        )
+        return 3
+
+    # Vérifie que modules.py expose bien ce que le CLI attend
+    required = [
+        "DiagnosticModule",
+        "BackupWMSModule",
+        "AuditObsolescenceModule",
+        "ModuleResult",
+        "print_result",
+        "save_json_report",
+    ]
+    missing = [x for x in required if not hasattr(mods, x)]
+    if missing:
+        print(
+            "Ton modules.py est importé mais il manque des symboles attendus par le CLI:\n"
+            f"  {', '.join(missing)}\n"
+            "Corrige modules.py (il doit fournir ces classes/fonctions).",
+            file=sys.stderr,
+        )
+        return 3
+
+    # Fix config : si modules.py a load_config (nouveau), on l'utilise
+    cfg_path_hint = ns.config or os.getenv("NTL_CONFIG") or "(défaut modules.py)"
+    if hasattr(mods, "load_config"):
+        try:
+            cfg = mods.load_config(ns.config)  # type: ignore[attr-defined]
+            cfg_path = cfg_path_hint
+        except Exception as e:
+            print(f"Erreur config: {e}", file=sys.stderr)
+            return 3
+    else:
+        cfg_raw, cfg_path = _load_config_legacy(ns.config)
+        cfg = _merge_defaults(cfg_raw)
 
     if ns.menu or not ns.cmd:
-        return _menu_loop(cfg, cfg_path)
+        return _menu_loop(mods, cfg, cfg_path)
 
     if ns.cmd == "diagnostic":
-        res = DiagnosticModule(cfg).run()
+        res = mods.DiagnosticModule(cfg).run()
     elif ns.cmd == "backup-wms":
-        res = BackupWMSModule(cfg).run()
+        res = mods.BackupWMSModule(cfg).run()
     elif ns.cmd == "audit-obsolescence":
-        res = AuditObsolescenceModule(cfg).run()
+        res = mods.AuditObsolescenceModule(cfg).run()
     else:
-        res = ModuleResult(module="tool", status="ERROR", summary=f"Commande inconnue: {ns.cmd}").finish()
+        res = mods.ModuleResult(module="tool", status="ERROR", summary=f"Commande inconnue: {ns.cmd}").finish()
 
-    json_path = save_json_report(res)
-    print_result(res, json_path=json_path, json_only=ns.json_only, quiet=ns.quiet, verbose=ns.verbose)
+    json_path = mods.save_json_report(res)
+    mods.print_result(res, json_path=json_path, json_only=ns.json_only, quiet=ns.quiet, verbose=ns.verbose)
     return int(res.exit_code or 0)
 
 
