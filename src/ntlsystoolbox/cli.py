@@ -20,15 +20,21 @@ try:
         print_result,
         save_json_report,
     )
-except Exception:
-    from modules import (  # type: ignore
-        AuditObsolescenceModule,
-        BackupWMSModule,
-        DiagnosticModule,
-        ModuleResult,
-        print_result,
-        save_json_report,
-    )
+except ImportError:
+    try:
+        from modules import (  # type: ignore
+            AuditObsolescenceModule,
+            BackupWMSModule,
+            DiagnosticModule,
+            ModuleResult,
+            print_result,
+            save_json_report,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "Impossible d'importer ntlsystoolbox.modules. "
+            "Vérifie PYTHONPATH=src ou installe le package (pip install -e .)."
+        ) from e
 
 __version__ = "1.0.0"
 
@@ -162,7 +168,6 @@ def _load_config(path: Optional[str]) -> Tuple[Dict[str, Any], str]:
         "config.json",
     ]
 
-    # 1) YAML si PyYAML dispo
     yaml_mod = None
     try:
         import yaml  # type: ignore
@@ -181,7 +186,6 @@ def _load_config(path: Optional[str]) -> Tuple[Dict[str, Any], str]:
                     with open(p, "r", encoding="utf-8") as f:
                         data = yaml_mod.safe_load(f) or {}
                     return (data if isinstance(data, dict) else {}), p
-                # YAML sans pyyaml -> on ignore et on continue
             except Exception:
                 return {}, p
 
@@ -288,7 +292,6 @@ def _menu_loop(cfg: Dict[str, Any], cfg_path: str) -> int:
             continue
 
         if choice == "3":
-            # le module gère son propre sous-menu (scan / eol list / csv report) pour rester fidèle à ton CLI
             res = AuditObsolescenceModule(cfg).run()
             _handle_result(res, json_only=False, quiet=False, verbose=True)
             _pause()
