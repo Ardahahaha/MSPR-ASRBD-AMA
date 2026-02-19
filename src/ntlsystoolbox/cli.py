@@ -4,21 +4,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ntlsystoolbox.modules import (
-    AuditObsolescenceModule,
-    BackupWMSModule,
-    DiagnosticModule,
-    ModuleResult,
-    print_result,
-    save_json_report,
-)
+# Import robuste : marche en package ET en exécution locale
+try:
+    from ntlsystoolbox.modules import (  # type: ignore
+        AuditObsolescenceModule,
+        BackupWMSModule,
+        DiagnosticModule,
+        ModuleResult,
+        print_result,
+        save_json_report,
+    )
+except Exception:
+    from modules import (  # type: ignore
+        AuditObsolescenceModule,
+        BackupWMSModule,
+        DiagnosticModule,
+        ModuleResult,
+        print_result,
+        save_json_report,
+    )
 
 __version__ = "1.0.0"
 
@@ -50,7 +60,10 @@ class UI:
             self.use_256 = False
 
     def clear(self) -> None:
-        os.system("cls" if os.name == "nt" else "clear")
+        try:
+            os.system("cls" if os.name == "nt" else "clear")
+        except Exception:
+            pass
 
     def _wrap(self, s: str, code: str) -> str:
         if not self.color:
@@ -131,11 +144,6 @@ DEFAULTS: Dict[str, Any] = {
 
 
 def _load_config(path: Optional[str]) -> Tuple[Dict[str, Any], str]:
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        return {}, "(pyyaml manquant)"
-
     candidates: List[str] = []
     if path:
         candidates.append(path)
@@ -150,17 +158,35 @@ def _load_config(path: Optional[str]) -> Tuple[Dict[str, Any], str]:
         "config.yaml",
         "config.example.yml",
         "config/config.example.yml",
+        "config/config.json",
+        "config.json",
     ]
+
+    # 1) YAML si PyYAML dispo
+    yaml_mod = None
+    try:
+        import yaml  # type: ignore
+
+        yaml_mod = yaml
+    except Exception:
+        yaml_mod = None
 
     for p in candidates:
         if p and os.path.exists(p):
             try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                return (data if isinstance(data, dict) else {}), p
+                if p.endswith(".json"):
+                    data = json.loads(Path(p).read_text(encoding="utf-8"))
+                    return (data if isinstance(data, dict) else {}), p
+                if yaml_mod is not None:
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = yaml_mod.safe_load(f) or {}
+                    return (data if isinstance(data, dict) else {}), p
+                # YAML sans pyyaml -> on ignore et on continue
             except Exception:
                 return {}, p
 
+    if yaml_mod is None:
+        return {}, "(pyyaml manquant + aucun json trouvé)"
     return {}, "(aucun fichier config trouvé)"
 
 
@@ -262,6 +288,7 @@ def _menu_loop(cfg: Dict[str, Any], cfg_path: str) -> int:
             continue
 
         if choice == "3":
+            # le module gère son propre sous-menu (scan / eol list / csv report) pour rester fidèle à ton CLI
             res = AuditObsolescenceModule(cfg).run()
             _handle_result(res, json_only=False, quiet=False, verbose=True)
             _pause()
@@ -280,7 +307,7 @@ def _menu_loop(cfg: Dict[str, Any], cfg_path: str) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ntl-systoolbox")
-    p.add_argument("--config", default=None, help="Chemin config yml (optionnel)")
+    p.add_argument("--config", default=None, help="Chemin config yml/json (optionnel)")
     p.add_argument("--json-only", action="store_true", help="Affiche uniquement le chemin du JSON")
     p.add_argument("--quiet", action="store_true", help="Sortie compacte")
     p.add_argument("--verbose", action="store_true", help="Détails")
